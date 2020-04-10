@@ -1,10 +1,11 @@
 { stdenv, fetchurl, makeWrapper
-, alsaLib, libpulseaudio, libX11, libXcursor, libXinerama, libXrandr, libXi, libGL
+, alsaLib, libpulseaudio, libSM, libICE, libX11, libXext, libXrandr, libXcursor, libXinerama, libXi, libGL
 , factorio-utils
 , releaseType
 , mods ? []
 , username ? "", token ? "" # get/reset token at https://factorio.com/profile
 , experimental ? false # true means to always use the latest branch
+, factorioDir ? "$HOME/.factorio"
 }:
 
 assert releaseType == "alpha"
@@ -12,6 +13,9 @@ assert releaseType == "alpha"
     || releaseType == "demo";
 
 let
+  inherit (stdenv.lib.lists) optional;
+  inherit (stdenv.lib.strings) concatStringsSep escapeShellArg;
+  makeOverridableRec = import ./makeOverridableRec.nix;
 
   helpMsg = ''
 
@@ -53,11 +57,11 @@ let
     x86_64-linux = let bdist = bdistForArch { inUrl = "linux64"; inTar = "x64"; }; in {
       alpha = {
         stable        = bdist { sha256 = "1fg2wnia6anzya4m53jf2xqwwspvwskz3awdb3j0v3fzijps94wc"; version = "0.17.79"; withAuth = true; };
-        experimental  = bdist { sha256 = "1fg2wnia6anzya4m53jf2xqwwspvwskz3awdb3j0v3fzijps94wc"; version = "0.17.79"; withAuth = true; };
+        experimental  = bdist { sha256 = "0fxqy822csdx1j15llm40vhg526mg0zf15jfjanrq00m2hxz4m92"; version = "0.18.22"; withAuth = true; };
       };
       headless = {
         stable        = bdist { sha256 = "1pr39nm23fj83jy272798gbl9003rgi4vgsi33f2iw3dk3x15kls"; version = "0.17.79"; };
-        experimental  = bdist { sha256 = "1pr39nm23fj83jy272798gbl9003rgi4vgsi33f2iw3dk3x15kls"; version = "0.17.79"; };
+        experimental  = bdist { sha256 = "0zrgfs89vbl7v7rqw8cx6i75p6rgvjp7yy9lpm41wb0qc6dk83nr"; version = "0.18.22"; };
       };
       demo = {
         stable        = bdist { sha256 = "07qknasaqvzl9vy1fglm7xmdi7ynhmslrb0a209fhbfs0s7qqlgi"; version = "0.17.79"; };
@@ -112,34 +116,44 @@ let
   asGz = builtins.replaceStrings [".xz"] [".gz"];
 
   configBaseCfg = ''
-    use-system-read-write-data-directories=false
     [path]
     read-data=$out/share/factorio/data/
+    write-data="${escapeShellArg factorioDir}"
     [other]
-    check_updates=false
+    check-updates=false
   '';
 
   updateConfigSh = ''
     #! $SHELL
-    if [[ -e ~/.factorio/config.cfg ]]; then
+    if [[ -e \""${escapeShellArg factorioDir}"/config.cfg\" ]]; then
       # Config file exists, but may have wrong path.
       # Try to edit it. I'm sure this is perfectly safe and will never go wrong.
-      sed -i 's|^read-data=.*|read-data=$out/share/factorio/data/|' ~/.factorio/config.cfg
+      sed -i 's|^read-data=.*|read-data=$out/share/factorio/data/|' \""${escapeShellArg factorioDir}"/config.cfg\"
     else
       # Config file does not exist. Phew.
-      install -D $out/share/factorio/config-base.cfg ~/.factorio/config.cfg
+      mkdir -p \""${escapeShellArg factorioDir}"\"
+      # Shell expand contents of config-base.cfg
+      while read line; do eval echo \$line; done < \"$out/share/factorio/config-base.cfg\" > \""${escapeShellArg factorioDir}"/config.cfg\"
     fi
   '';
 
   modDir = factorio-utils.mkModDirDrv mods;
 
-  base = with actual; {
+  base = makeOverridableRec (self: with actual; {
     name = "factorio-${releaseType}-${version}";
 
     inherit src;
 
     preferLocalBuild = true;
     dontBuild = true;
+
+    buildInputs = [ makeWrapper ];
+
+    wrapProgramFlags = [
+        ''--run "$out/share/factorio/update-config.sh"''
+        ''--argv0 "factorio"''
+        ''--add-flags "-c \""${escapeShellArg factorioDir}"/config.cfg\""''
+    ] ++ (optional (mods != []) "--add-flags --mod-directory=${modDir}");
 
     installPhase = ''
       mkdir -p $out/{bin,share/factorio}
@@ -148,7 +162,29 @@ let
       patchelf \
         --set-interpreter $(cat $NIX_CC/nix-support/dynamic-linker) \
         $out/bin/factorio
-    '';
+      wrapProgram $out/bin/factorio                                \
+        ${concatStringsSep " " self.wrapProgramFlags}
+
+        # TODO Currently, every time a mod is changed/added/removed using the
+        # modlist, a new derivation will take up the entire footprint of the
+        # client. The only way to avoid this is to remove the mods arg from the
+        # package function. The modsDir derivation will have to be built
+        # separately and have the user specify it in the .factorio config or
+        # right along side it using a symlink into the store I think i will
+        # just remove mods for the client derivation entirely. this is much
+        # cleaner and more useful for headless mode.
+
+        # TODO: trying to toggle off a mod will result in read-only-fs-error.
+        # not much we can do about that except warn the user somewhere. In
+        # fact, no exit will be clean, since this error will happen on close
+        # regardless. just prints an ugly stacktrace but seems to be otherwise
+        # harmless, unless maybe the user forgets and tries to use the mod
+        # manager.
+
+      install -m0644 <(echo "${configBaseCfg}") $out/share/factorio/config-base.cfg
+
+      install -m0755 <(echo "${updateConfigSh}") $out/share/factorio/update-config.sh
+      '';
 
     meta = {
       description = "A game in which you build and maintain factories";
@@ -169,66 +205,37 @@ let
       maintainers = with stdenv.lib.maintainers; [ Baughn elitak ];
       platforms = [ "i686-linux" "x86_64-linux" ];
     };
-  };
+  });
 
   releases = rec {
     headless = base;
-    demo = base // {
+    demo = base.override (super: {
 
-      buildInputs = [ makeWrapper libpulseaudio ];
+      wrapProgramFlags = [ ''--prefix LD_LIBRARY_PATH : /run/opengl-driver/lib:$libPath'' ] ++ base.wrapProgramFlags;
+
+      buildInputs = super.buildInputs ++ [ libpulseaudio ];
 
       libPath = stdenv.lib.makeLibraryPath [
         alsaLib
         libpulseaudio
         libX11
+        libXext
         libXcursor
         libXinerama
         libXrandr
         libXi
         libGL
+        libSM
+        libICE
       ];
+    });
 
-      installPhase = base.installPhase + ''
-        wrapProgram $out/bin/factorio                                \
-          --prefix LD_LIBRARY_PATH : /run/opengl-driver/lib:$libPath \
-          --run "$out/share/factorio/update-config.sh"               \
-          --argv0 ""                                                 \
-          --add-flags "-c \$HOME/.factorio/config.cfg"               \
-          ${if mods!=[] then "--add-flags --mod-directory=${modDir}" else ""}
-
-          # TODO Currently, every time a mod is changed/added/removed using the
-          # modlist, a new derivation will take up the entire footprint of the
-          # client. The only way to avoid this is to remove the mods arg from the
-          # package function. The modsDir derivation will have to be built
-          # separately and have the user specify it in the .factorio config or
-          # right along side it using a symlink into the store I think i will
-          # just remove mods for the client derivation entirely. this is much
-          # cleaner and more useful for headless mode.
-
-          # TODO: trying to toggle off a mod will result in read-only-fs-error.
-          # not much we can do about that except warn the user somewhere. In
-          # fact, no exit will be clean, since this error will happen on close
-          # regardless. just prints an ugly stacktrace but seems to be otherwise
-          # harmless, unless maybe the user forgets and tries to use the mod
-          # manager.
-
-        install -m0644 <(cat << EOF
-        ${configBaseCfg}
-        EOF
-        ) $out/share/factorio/config-base.cfg
-
-        install -m0755 <(cat << EOF
-        ${updateConfigSh}
-        EOF
-        ) $out/share/factorio/update-config.sh
-      '';
-    };
-    alpha = demo // {
+    alpha = demo.override (super: {
 
       installPhase = demo.installPhase + ''
         cp -a doc-html $out/share/factorio
       '';
-    };
+    });
   };
 
-in stdenv.mkDerivation (releases.${releaseType})
+in stdenv.mkDerivation (builtins.removeAttrs releases.${releaseType} [ "override" ])
